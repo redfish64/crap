@@ -1,7 +1,8 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 # if systemd is used and you need sound, login to $console prior https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=747882
 # if you can't stand cursor bug, start this script from console, not another X https://bugs.launchpad.net/ubuntu/+source/plasma-workspace/+bug/1684240
+
 
 ### configuration ###
 display=1
@@ -9,14 +10,27 @@ console=1
 tmpdir=$XDG_RUNTIME_DIR/nvidia
 # see alternative packages with "nix-instantiate --eval -E 'with import <nixpkgs> {}; linuxPackages.nvidiaPackages'"
 package="linuxPackages.nvidia_x11"
-busid=$($(nix-build --no-out-link '<nixpkgs>' -A pciutils)/bin/lspci | awk '/(3D controller|VGA compatible controller): NVIDIA/{gsub(/\./,":",$1); print $1}')
+
+function nixbuildnamed()
+{
+    OUT="$tmpdir/built_$1"
+    rm -f $OUT
+    shift
+    echo nix-build "$@" --out-link $OUT  >&2
+    nix-build "$@" --out-link $OUT 
+}
+
+busid=$($(nixbuildnamed pciutils '<nixpkgs>' -A pciutils)/bin/lspci | awk '/VGA compatible controller: NVIDIA /{gsub(/\./,":",$1); print $1}')
 kernel="$(uname -r)"
+
+XF86INPUTLIBINPUT=$(nixbuildnamed xf86inputlibinput '<nixpkgs>' -A xorg.xf86inputlibinput)
+NVIDIA_X11=$(nixbuildnamed package '<nixpkgs>' -A $package.bin)
 
 mkdir -p $tmpdir/modules
 cat > $tmpdir/xorg.conf << EOF
 Section "Files"
-  ModulePath "$(nix-build --no-out-link '<nixpkgs>' -A xorg.xf86inputlibinput)/lib/xorg/modules/input"
-  ModulePath "$(nix-build --no-out-link '<nixpkgs>' -A $package.bin)/lib/xorg/modules"
+  ModulePath "$XF86INPUTLIBINPUT/lib/xorg/modules/input"
+  ModulePath "$NVIDIA_X11/lib/xorg/modules"
   ModulePath "$tmpdir/modules"
 EndSection
 
@@ -67,10 +81,6 @@ if [ "$busid" == "" ]; then
   echo -e "$red No Optimus card found"
   exit 1
 fi
-if [ ! -d "$(nix-build --no-out-link -E 'with import <nixpkgs/nixos> {}; config.boot.kernelPackages.kernel.dev')/lib/modules/$kernel" ]; then
-  echo -e "$red There is a mismatch between config.boot.kernelPackages.kernel: $(nix-instantiate --eval --strict -E '(import <nixpkgs/nixos> {}).config.boot.kernelPackages.kernel.dev.version') and currently running kernel: $kernel. Reboot is required."
-  exit 1
-fi
 # module nvidia_drm is in use
 if [ "$(sudo fgconsole)" == "$console" ]; then
   echo -e "$red You need to run $0 from another console"
@@ -80,11 +90,9 @@ if [ -z "$XAUTHORITY" ]; then
   export XAUTHORITY=$HOME/.Xauthority
 fi
 
-cat > $tmpdir/session << EOF
-#!/bin/sh
-$(nix-build --no-out-link '<nixpkgs>' -A xorg.xrandr)/bin/xrandr --setprovideroutputsource modesetting NVIDIA-0
-$(nix-build --no-out-link '<nixpkgs>' -A xorg.xrandr)/bin/xrandr --auto
-export LD_LIBRARY_PATH="$(nix-build --no-out-link -E '
+XRANDR=$(nixbuildnamed xrandr '<nixpkgs>' -A xorg.xrandr)
+
+NVIDIA_LIBS=$(nixbuildnamed nvidia_libs -E '
   with import <nixpkgs> {};
 
   buildEnv {
@@ -97,14 +105,41 @@ export LD_LIBRARY_PATH="$(nix-build --no-out-link -E '
       })
     ];
   }
-')/lib`
-  `:$(nix-build --no-out-link -E '
+')
+
+NVIDIA_LIBS32=$(nixbuildnamed nvidia_libs32 -E '
     with import <nixpkgs> {};
 
     buildEnv {
       name = "nvidia-libs-32";
-      paths = [ pkgsi686Linux.libglvnd '$package'.lib32 ];
-  }')/lib"
+      paths = with pkgsi686Linux; [
+        libglvnd
+        ('$package'.override {
+          libsOnly = true;
+          kernel = null;
+        })
+      ];
+  }
+')
+
+
+NVIDIA_X11_LIBS_ONLY=$(nixbuildnamed nvidia_x11_libs_only -E '
+  with import <nixpkgs> {};
+
+  '$package'.override {
+    libsOnly = true;
+    kernel = null;
+  }
+')
+
+LIBGLVND=$(nixbuildnamed '<nixpkgs>' -A libglvnd)
+
+cat > $tmpdir/session << EOF
+#!/usr/bin/env bash
+$XRANDR/bin/xrandr --setprovideroutputsource modesetting NVIDIA-0
+$XRANDR/bin/xrandr --auto
+export LD_LIBRARY_PATH="$NVIDIA_LIBS/lib`
+  `:$NVIDIA_LIBS32/lib"
 #export PATH="\$(nix-build --no-out-link -E '
 #  with import <nixpkgs> {};
 #
@@ -113,22 +148,8 @@ export LD_LIBRARY_PATH="$(nix-build --no-out-link -E '
 #    paths = [ '$package'.settings '$package'.bin ];
 #  }
 #')/bin:\$PATH"
-export VK_ICD_FILENAMES="$(nix-build --no-out-link -E '
-  with import <nixpkgs> {};
-
-  '$package'.override {
-    libsOnly = true;
-    kernel = null;
-  }
-')/share/vulkan/icd.d/nvidia.json";
-export OCL_ICD_VENDORS="$(nix-build --no-out-link -E '
-  with import <nixpkgs> {};
-
-  '$package'.override {
-    libsOnly = true;
-    kernel = null;
-  }
-')/etc/OpenCL/vendors/nvidia.icd";
+export VK_ICD_FILENAMES=$NVIDIA_X11_LIBS_ONLY/share/vulkan/icd.d/nvidia.json";
+export OCL_ICD_VENDORS=$NVIDIA_X11_LIBS_ONLY/etc/OpenCL/vendors/nvidia.icd";
 # https://bugzilla.gnome.org/show_bug.cgi?id=774775
 export GDK_BACKEND=x11
 $@
@@ -143,13 +164,15 @@ sudo -u $USER $tmpdir/session
 EOF
 chmod +x $tmpdir/wrapper
 
+X_DIR=$(nixbuildnamed X '<nixpkgs>' -A xorg.xorgserver)
+
 # dixRegisterPrivateKey: Assertion `!global_keys[type].created' failed
-#cat > $tmpdir/X << EOF
+cat > $tmpdir/X << EOF
 #!/bin/sh
-#LD_LIBRARY_PATH="$(nix-build --no-out-link '<nixpkgs>' -A libglvnd)/lib"
-#exec $(nix-build --no-out-link '<nixpkgs>' -A xorg.xorgserver)/bin/X "\$@"
-#EOF
-#chmod +x $tmpdir/X
+LD_LIBRARY_PATH="$LIBGLVND/lib"
+exec $X_DIR/bin/X "\$@"
+EOF
+chmod +x $tmpdir/X
 
 get_major_version()
 {
@@ -160,8 +183,8 @@ get_major_version()
 }
 
 if [ -e /etc/nixos ]; then
-  # complicated to always check non-nixos rules on nixos
-  bbswitch="$(nix-build --no-out-link -E '
+    # complicated to always check non-nixos rules on nixos
+  bbswitch="$(nixbuildnamed bbswitch -E '
     with import <nixpkgs/nixos> {};
 
     let
@@ -174,7 +197,7 @@ if [ -e /etc/nixos ]; then
       };
     }
   ')"
-  nvidia="$(nix-build --no-out-link -E '
+  nvidia="$(nixbuildnamed nvidia -E '
     with import <nixpkgs/nixos> {};
 
     let
@@ -185,7 +208,7 @@ if [ -e /etc/nixos ]; then
     })).bin
   ')"
 else
-  bbswitch="$(nix-build --no-out-link -E '
+  bbswitch="$(nixbuildnamed bbswitch -E '
     with import <nixpkgs> {};
 
     let
@@ -200,7 +223,7 @@ else
   # needed for arch
   sudo ln -s /lib/modules/$kernel/build /lib/modules/$kernel/source
   get_major_version /lib/modules/$kernel/source/include/generated/compile.h
-  nvidia="$(nix-build --no-out-link -E '
+  nvidia="$(nixbuildnamed nvidia -E '
     with import <nixpkgs> {};
 
     (('$package'.override { stdenv = overrideCC stdenv gcc'$kernel_cc_major'; }).overrideAttrs (oldAttrs: rec {
@@ -221,13 +244,12 @@ do
 done
 
 # https://bugs.freedesktop.org/show_bug.cgi?id=94577
-ln -sf $(nix-build --no-out-link '<nixpkgs>' -A xorg.xorgserver)/lib/xorg/modules/* $tmpdir/modules
+ln -sf $(nixbuildnamed xorgserver '<nixpkgs>' -A xorg.xorgserver)/lib/xorg/modules/* $tmpdir/modules
 rm $tmpdir/modules/libglamoregl.so
 
-xinit=$(nix-build --no-out-link '<nixpkgs>' -A xorg.xinit)/bin
+xinit=$(nixbuildnamed xinit '<nixpkgs>' -A xorg.xinit)/bin
 # xinit is unsecure
-#sudo PATH=$xinit:$PATH $xinit/startx $tmpdir/wrapper -- $tmpdir/X :$display -config $tmpdir/xorg.conf -logfile $tmpdir/X.log vt$console
-sudo PATH=$xinit:$PATH $xinit/startx $tmpdir/wrapper -- $(nix-build --no-out-link '<nixpkgs>' -A xorg.xorgserver)/bin/X :$display -config $tmpdir/xorg.conf -logfile $tmpdir/X.log vt$console
+sudo PATH=$xinit:$PATH $xinit/startx $tmpdir/wrapper -- $tmpdir/X :$display -config $tmpdir/xorg.conf -logfile $tmpdir/X.log vt$console
 sudo chown $USER $XAUTHORITY
 
 for m in nvidia_uvm nvidia_drm nvidia_modeset nvidia
